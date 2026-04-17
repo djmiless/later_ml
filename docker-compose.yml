@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# Local development / demo stack
+#
+# Usage:
+#   docker-compose up --build
+#   curl http://localhost:8080/health
+#   curl -X POST http://localhost:8080/predict \
+#        -H 'Content-Type: application/json' \
+#        -d '{"age":42,"income_k":88.0,"tenure_years":6}'
+# ---------------------------------------------------------------------------
+
+version: "3.9"
+
+services:
+  inference:
+    build:
+      context: .
+      dockerfile: inference/Dockerfile
+    image: regression-inference:local
+    container_name: regression-inference
+    ports:
+      - "8080:8080"
+    environment:
+      MODEL_PATH: /app/models/regression_model.joblib
+      MODEL_VERSION: "1"
+      PORT: "8080"
+    volumes:
+      # Mount the local models directory so you don't need to rebuild the image
+      # after retraining — just restart the container.
+      - ./models:/app/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

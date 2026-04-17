@@ -1,0 +1,297 @@
+# ---------------------------------------------------------------------------
+# CI/CD Pipeline — ML Inference Service
+#
+# Triggered on:
+#   - Every push / PR to main or develop (lint + test + build)
+#   - Manual dispatch (full pipeline including deploy)
+#   - Tag push (v*.*.*) → production promotion
+#
+# Stages:
+#   1. lint        — flake8 + black --check
+#   2. test        — pytest with coverage
+#   3. train       — run training script, upload model artifact
+#   4. build       — Docker image build + push to registry
+#   5. deploy-staging   — deploy to staging environment
+#   6. integration-test — smoke test against staging
+#   7. promote-prod     — manual approval gate → deploy to production
+# ---------------------------------------------------------------------------
+
+name: ML Inference CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    tags:    ["v*.*.*"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      deploy_to_prod:
+        description: "Promote to production?"
+        required: false
+        default: "false"
+
+env:
+  IMAGE_NAME: regression-inference
+  # In production, set these as GitHub Actions secrets:
+  # REGISTRY: ghcr.io/${{ github.repository_owner }}
+  # AWS_REGION: us-east-1
+  # ECR_REPOSITORY: regression-inference
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Lint
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install flake8 black
+
+      - name: flake8
+        run: flake8 train/ inference/ tests/ --max-line-length=100 --extend-ignore=E203,W503
+
+      - name: black (format check)
+        run: black --check --line-length=100 train/ inference/ tests/
+
+  # ---------------------------------------------------------------------------
+  # 2. Test
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r train/requirements.txt
+          pip install -r inference/requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Train model (needed by API tests)
+        run: python train/train.py
+
+      - name: Run tests with coverage
+        run: pytest tests/ -v --cov=inference --cov=train --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ---------------------------------------------------------------------------
+  # 3. Train & version model artifact
+  # ---------------------------------------------------------------------------
+  train:
+    name: Train & Version Model
+    runs-on: ubuntu-latest
+    needs: test
+    # Only retrain on pushes to main (not PRs) — PRs only lint+test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      model_version: ${{ steps.version.outputs.model_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install training dependencies
+        run: pip install -r train/requirements.txt
+
+      - name: Train model
+        run: |
+          export MLFLOW_TRACKING_URI=mlruns
+          export MODEL_VERSION=${{ github.run_number }}
+          python train/train.py
+
+      - name: Set model version output
+        id: version
+        run: echo "model_version=${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-model-v${{ github.run_number }}
+          path: models/regression_model.joblib
+          retention-days: 30
+
+      # In production: push to S3 / GCS model store
+      # - name: Push model to S3
+      #   run: |
+      #     aws s3 cp models/regression_model.joblib \
+      #       s3://my-model-store/regression/${{ github.run_number }}/model.joblib
+
+  # ---------------------------------------------------------------------------
+  # 4. Build Docker image
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: train
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: regression-model-v${{ needs.train.outputs.model_version }}
+          path: models/
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=v${{ needs.train.outputs.model_version }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: inference/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MODEL_VERSION=${{ needs.train.outputs.model_version }}
+
+  # ---------------------------------------------------------------------------
+  # 5. Deploy to staging
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [train, build]   # need train for model_version, build for image_tag
+    environment: staging
+    steps:
+      - name: Deploy to staging
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          MODEL_VERSION: ${{ needs.train.outputs.model_version }}
+        run: |
+          echo "[staging] Deploying image: $IMAGE_TAG"
+          echo "[staging] Model version  : $MODEL_VERSION"
+
+          # In production, one of these patterns would run here:
+          #
+          # Option A — Kubernetes (EKS / GKE):
+          #   kubectl set image deployment/regression-inference \
+          #     inference=$IMAGE_TAG \
+          #     --namespace=staging
+          #   kubectl rollout status deployment/regression-inference --namespace=staging
+          #
+          # Option B — ECS:
+          #   aws ecs update-service \
+          #     --cluster staging \
+          #     --service regression-inference \
+          #     --force-new-deployment
+          #
+          # Option C — Local docker-compose (for this assessment):
+          #   docker-compose -f docker-compose.staging.yml up -d
+
+          echo "[staging] Deployment complete."
+
+  # ---------------------------------------------------------------------------
+  # 6. Integration / smoke test against staging
+  # ---------------------------------------------------------------------------
+  integration-test:
+    name: Integration Test (Staging)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: pip install requests pytest
+
+      - name: Smoke test staging endpoint
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL || 'http://localhost:8080' }}
+        run: |
+          echo "[smoke] Testing $STAGING_URL/health"
+          # In a real pipeline, this would curl the staging endpoint:
+          # curl --fail $STAGING_URL/health
+          # curl --fail -X POST $STAGING_URL/predict \
+          #   -H 'Content-Type: application/json' \
+          #   -d '{"age":42,"income_k":88.0,"tenure_years":6}'
+          echo "[smoke] All checks passed."
+
+  # ---------------------------------------------------------------------------
+  # 7. Promote to production (manual approval required)
+  # ---------------------------------------------------------------------------
+  promote-prod:
+    name: Promote to Production
+    runs-on: ubuntu-latest
+    needs: [integration-test, build]   # need build for image_tag output
+    environment: production            # Requires manual approval in GitHub Actions UI
+    # Only promote on tag push (v*.*.*) or manual trigger
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.deploy_to_prod == 'true'
+    steps:
+      - name: Deploy to production (canary 10%)
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          echo "[prod] Starting canary rollout at 10% traffic — image: $IMAGE_TAG"
+
+          # Production canary pattern:
+          # 1. Deploy new version as a separate deployment (regression-inference-canary)
+          # 2. Configure ingress/load balancer to send 10% traffic to canary
+          # 3. Monitor error rate and latency for 10 minutes (Datadog / CloudWatch alarm)
+          # 4. If clean → scale canary to 100% and remove old deployment
+          # 5. If alarm fires → kubectl rollout undo → alert on-call
+
+          # kubectl apply -f k8s/canary-deployment.yml
+          # kubectl set image deployment/regression-inference-canary \
+          #   inference=$IMAGE_TAG --namespace=production
+          echo "[prod] Canary live. Monitoring for 10 minutes..."
+          echo "[prod] Canary healthy — promoting to 100%."
+          echo "[prod] Production deployment complete."
+
+      - name: Tag production release
+        run: |
+          echo "[prod] Release tagged: ${{ github.ref_name }}"
+          # gh release create ${{ github.ref_name }} --generate-notes

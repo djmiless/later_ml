@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# MLflow
+mlruns/
+
+# Generated artifacts (committed in the Docker image, not in git)
+models/*.joblib
+models/*.json
+data/*.csv
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# macOS
+.DS_Store
+
+# Secrets
+.env
+*.pem
+
+# Claude Code internals
+.claude/
